@@ -8,7 +8,7 @@ def feature_matching (img_paths, image_output_path,label_output_path):
     MatchingModule = DinoFeatureMatching(refine_mask_auto = False,
                                          refine_mask_manual = True,
                                          superpixel="felzenszwalb",
-                                         debug = False,
+                                         debug = True,
                                          show_scale_percentage=50)
     
     for img_path in img_paths:

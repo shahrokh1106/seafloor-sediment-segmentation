@@ -9,6 +9,13 @@ import torch.nn.functional as F
 import scipy.ndimage as ndimage
 
 
+
+
+from PIL import Image
+from FeatUp.featup.util import norm, unnorm
+from FeatUp.featup.plotting import plot_feats, plot_lang_heatmaps
+
+
 SEED = 42
 random.seed(SEED)                   
 np.random.seed(SEED)               
@@ -28,10 +35,9 @@ class DinoFeatureMatching():
         self.show_scale_percentage = show_scale_percentage
         self.inputsize = 518
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = timm.create_model("vit_base_patch14_dinov2.lvd142m", pretrained=True)
-        self.model.to(self.device)
+        self.model = torch.hub.load("mhamilton723/FeatUp", 'dinov2', use_norm=True).to(self.device)
         self.model.eval()
-        self.transform = T.Compose([T.ToPILImage(),T.Resize((self.inputsize, self.inputsize)),T.ToTensor(),T.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])])
+        self.transform = T.Compose([T.ToPILImage(),T.Resize((self.inputsize, self.inputsize)),T.ToTensor(),norm])
     
     def get_roi(self,image,show_scale = 300):
         IMAGE = image.copy()
@@ -84,53 +90,61 @@ class DinoFeatureMatching():
         patch_image = image[y1_r:y2_r, x1_r:x2_r]
         return patch_image
     
-    def get_patch_feature(self,patch):
-        patch_image = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
-        with torch.no_grad():
-            patch_tensor = self.transform(patch_image).unsqueeze(0).to(self.device)  # [1, 3, 518, 518]
-            patch_embedding = self.model.forward_features(patch_tensor)  # base:[1, 1370, 768] large: [1, 1370, 1024]
-            patch_embedding = patch_embedding[:, 1:, :].mean(dim=1) # [1, dim]-->base: [1, 768] large: [1, 1024]
-            patch_embedding = patch_embedding.squeeze().cpu().numpy()
-            patch_embedding = patch_embedding / np.linalg.norm(patch_embedding)
-        return patch_embedding
     
-    def get_image_feature(self,image):
+    # def get_patch_feature(self, patch):
+    #     patch_image = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+    #     with torch.no_grad():
+    #         patch_tensor = self.transform(patch_image).unsqueeze(0).to(self.device)  # [1, 3, 518, 518]
+    #         patch_embedding = self.model(patch_tensor)  # [1, 384, 592, 592] up-sclaed from [1, 384, 37, 37] using FeatUp
+    #         patch_embedding = patch_embedding.contiguous().view(1,patch_embedding.shape[1],-1) # [1, 384, 350464]
+    #         patch_embedding = patch_embedding.permute(0,2,1) # [1, 350464, 384]
+    #         feature_vector = patch_embedding.mean(dim=1) # [1, 384]
+    #         # feature_vector = F.normalize(spatial_tokens, dim=-1).squeeze().cpu().numpy() # [384,]
+    #         feature_vector = feature_vector.squeeze().cpu().numpy() # [384,]
+    #         return feature_vector
+        
+    def get_patch_feature(self, roi,width,height, image_embedding):
+        H_prime = int(np.sqrt(image_embedding.shape[0]))
+        W_prime = H_prime
+        C = image_embedding.shape[1]
+        image_embedding = image_embedding.reshape(H_prime, W_prime, C)  # shape: [H', W', C]
+
+        # Scale ROI to match embedding resolution
+        scale_x = W_prime / width
+        scale_y = H_prime / height
+        x1, y1, x2, y2 = roi
+        x1 = int(x1 * scale_x)
+        x2 = int(x2 * scale_x)
+        y1 = int(y1 * scale_y)
+        y2 = int(y2 * scale_y)
+
+        # Clip to valid range
+        # x1, y1 = max(x1, 0), max(y1, 0)
+        # x2, y2 = min(x2, W_prime), min(y2, H_prime)
+
+       
+        patch_features = image_embedding[y1:y2, x1:x2, :]  # shape: [h, w, C]
+        patch_features = patch_features.mean(axis=(0, 1)) 
+        return patch_features
+
+
+
+       
+    
+    def get_image_feature(self, image):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         with torch.no_grad():
-            full_tensor = self.transform(image).unsqueeze(0).to(self.device) # [1, 3, 518, 518]
-            full_embedding = self.model.forward_features(full_tensor)  # base:[1, 1370, 768] large: [1, 1370, 1024]
-            full_embedding = full_embedding[:, 1:, :]  # remove CLS → base: [1, 1369, 768] large:[1, 1369, 1024]
-            full_embedding = full_embedding[0].reshape(37, 37, 768)
-        full_embedding = full_embedding.reshape(-1, full_embedding.shape[-1]).cpu().numpy()  # [1369, 768] 
-        full_embedding = full_embedding / np.linalg.norm(full_embedding, axis=1, keepdims=True)
-        return full_embedding
-    
-    def get_patch_feature_(self, patch):
-        patch_image = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
-        with torch.no_grad():
-            patch_tensor = self.transform(patch_image).unsqueeze(0).to(self.device)  # [1, 3, 518, 518]
-            patch_embedding = self.model.forward_features(patch_tensor)  # [1, 1370, 768]
-            cls_token = patch_embedding[:, 0]                          # [1, 768]
-            spatial_tokens = patch_embedding[:, 1:, :].mean(dim=1)    # [1, 768]
-            fused_vector = torch.cat([cls_token, spatial_tokens], dim=-1)  # [1, 1536]
-            fused_vector = F.normalize(fused_vector, dim=-1)
-            return fused_vector.squeeze().cpu().numpy()  # [1536,]
-    
-    def get_image_feature_(self, image):
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        with torch.no_grad():
-            full_tensor = self.transform(image).unsqueeze(0).to(self.device)
-            full_embedding = self.model.forward_features(full_tensor)  # [1, 1370, 768]
-            spatial_tokens = full_embedding[:, 1:, :]  # [1, 1369, 768]
-            cls_token = full_embedding[:, 0].repeat(1, 1369).reshape(1, 1369, 768)  # repeat CLS to align
-            fused_tokens = torch.cat([cls_token, spatial_tokens], dim=-1)  # [1, 1369, 1536]
-            fused_tokens = fused_tokens.squeeze().cpu().numpy()
-            fused_tokens = fused_tokens / np.linalg.norm(fused_tokens, axis=1, keepdims=True)
-        return fused_tokens  # [1369, 1536]
+            image_tensor = self.transform(image).unsqueeze(0).to(self.device) # [1, 3, 518, 518]
+            image_embedding =self.model(image_tensor)  # [1, 384, 592, 592] up-sclaed from [1, 384, 37, 37] using FeatUp
+            image_embedding = image_embedding.contiguous().view(1,image_embedding.shape[1],-1) # [1, 384, 350464]
+            feature_vector = image_embedding.permute(0,2,1).squeeze().cpu().numpy()  # [1, 350464, 384]
+            feature_vector = feature_vector / np.linalg.norm(feature_vector, axis=1, keepdims=True)
+        return feature_vector # [350464, 384]
    
-    def get_similarity_map(self,full_embedding,patch_embedding,width, height):
-        similarity = full_embedding @ patch_embedding.T  # [1369,]
-        sim_map = similarity.reshape(37, 37)
+    def get_similarity_map(self,image_embedding,patch_embedding,width, height):
+    
+        similarity = image_embedding @ patch_embedding.T  # [350464,]
+        sim_map = similarity.reshape(int(np.sqrt(similarity.shape[0])), int(np.sqrt(similarity.shape[0]))) # [592,592]
         sim_map_resized = cv2.resize(sim_map, (width, height), interpolation=cv2.INTER_CUBIC)
         return sim_map_resized
     
@@ -147,7 +161,7 @@ class DinoFeatureMatching():
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
-    def adaptive_mask(self, sim_map, sigma=2, k=0.5):
+    def adaptive_mask(self, sim_map, sigma=2, k=2):
         blurred = ndimage.gaussian_filter(sim_map, sigma=sigma)
         mean_val = blurred.mean()
         std_val = blurred.std()
@@ -273,8 +287,10 @@ class DinoFeatureMatching():
         resized_image = cv2.resize(img_org, (self.inputsize, self.inputsize), interpolation=cv2.INTER_AREA)
         patch_image = self.get_patch_image(resized_image,roi,width=width,height=height)
         full_image = img_org.copy()
-        patch_embedding = self.get_patch_feature_(patch_image)
-        image_embedding = self.get_image_feature_(full_image)
+  
+        
+        image_embedding = self.get_image_feature(full_image)
+        patch_embedding = self.get_patch_feature(roi,width,height, image_embedding)
         sim_map= self.get_similarity_map(image_embedding, patch_embedding,width,height)
         overlay = self.get_overlay_heatmap(sim_map,img_org.copy())
         if self.debug:
