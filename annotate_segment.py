@@ -5,12 +5,11 @@ import random
 random.seed(42)
 
 def feature_matching (img_paths, image_output_path,label_output_path):
-    MatchingModule = DinoFeatureMatching(refine_mask_auto = False,
+    MatchingModule = DinoFeatureMatching(refine_mask_auto = True,
                                          refine_mask_manual = True,
                                          superpixel="felzenszwalb",
-                                         debug = True,
+                                         debug = False,
                                          show_scale_percentage=50)
-    
     for img_path in img_paths:
         existing_annotations = glob.glob(os.path.join(label_output_path, "*"))
         existing_annotations = [os.path.basename(path) for path in existing_annotations]
@@ -22,7 +21,6 @@ def feature_matching (img_paths, image_output_path,label_output_path):
             cv2.imwrite(os.path.join(image_output_path, name),img_org)
             cv2.imwrite(os.path.join(label_output_path, name),mask)
     print("all done")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Annotate a seafloor-sediment image for phase-1 and phase-2.")

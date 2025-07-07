@@ -7,10 +7,12 @@ import timm
 import torchvision.transforms as T
 import torch.nn.functional as F
 import scipy.ndimage as ndimage
-
-
-
-
+from skimage.util import img_as_float
+from skimage.segmentation import mark_boundaries
+from skimage.segmentation import felzenszwalb
+from skimage.segmentation import quickshift
+from scipy import ndimage as ndi
+from skimage.segmentation import slic
 from PIL import Image
 from FeatUp.featup.util import norm, unnorm
 from FeatUp.featup.plotting import plot_feats, plot_lang_heatmaps
@@ -90,25 +92,11 @@ class DinoFeatureMatching():
         patch_image = image[y1_r:y2_r, x1_r:x2_r]
         return patch_image
     
-    
-    # def get_patch_feature(self, patch):
-    #     patch_image = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
-    #     with torch.no_grad():
-    #         patch_tensor = self.transform(patch_image).unsqueeze(0).to(self.device)  # [1, 3, 518, 518]
-    #         patch_embedding = self.model(patch_tensor)  # [1, 384, 592, 592] up-sclaed from [1, 384, 37, 37] using FeatUp
-    #         patch_embedding = patch_embedding.contiguous().view(1,patch_embedding.shape[1],-1) # [1, 384, 350464]
-    #         patch_embedding = patch_embedding.permute(0,2,1) # [1, 350464, 384]
-    #         feature_vector = patch_embedding.mean(dim=1) # [1, 384]
-    #         # feature_vector = F.normalize(spatial_tokens, dim=-1).squeeze().cpu().numpy() # [384,]
-    #         feature_vector = feature_vector.squeeze().cpu().numpy() # [384,]
-    #         return feature_vector
-        
     def get_patch_feature(self, roi,width,height, image_embedding):
         H_prime = int(np.sqrt(image_embedding.shape[0]))
         W_prime = H_prime
         C = image_embedding.shape[1]
         image_embedding = image_embedding.reshape(H_prime, W_prime, C)  # shape: [H', W', C]
-
         # Scale ROI to match embedding resolution
         scale_x = W_prime / width
         scale_y = H_prime / height
@@ -117,19 +105,12 @@ class DinoFeatureMatching():
         x2 = int(x2 * scale_x)
         y1 = int(y1 * scale_y)
         y2 = int(y2 * scale_y)
-
         # Clip to valid range
         # x1, y1 = max(x1, 0), max(y1, 0)
         # x2, y2 = min(x2, W_prime), min(y2, H_prime)
-
-       
         patch_features = image_embedding[y1:y2, x1:x2, :]  # shape: [h, w, C]
         patch_features = patch_features.mean(axis=(0, 1)) 
         return patch_features
-
-
-
-       
     
     def get_image_feature(self, image):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
