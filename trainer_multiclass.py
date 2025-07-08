@@ -15,19 +15,9 @@ from tqdm import tqdm
 import numpy as np
 from sklearn.metrics import f1_score, accuracy_score
 from torchmetrics.classification import BinaryJaccardIndex
+from torchmetrics.classification import JaccardIndex
+from collections import Counter
 import argparse
-import random 
-from featup.upsamplers import JBUStack
-
-SEED = 42
-random.seed(SEED)                   
-np.random.seed(SEED)               
-torch.manual_seed(SEED)            
-torch.cuda.manual_seed(SEED)       
-torch.cuda.manual_seed_all(SEED)   
-torch.backends.cudnn.deterministic = True   
-torch.backends.cudnn.benchmark = False      
-os.environ['PYTHONHASHSEED'] = str(SEED)   
 
 
 class DINOv2SegHead(nn.Module):
@@ -101,7 +91,9 @@ class DINOv2SegHeadV2(nn.Module):
         out = self.decoder(fused)
         return self.upsample(out)
     
-
+# ---------------------------
+# DATASET
+# ---------------------------
 class SegmentationDataset(Dataset):
     def __init__(self, image_paths, mask_paths, transform=None):
         self.image_paths = image_paths
@@ -114,14 +106,13 @@ class SegmentationDataset(Dataset):
     def __getitem__(self, idx):
         image = cv2.imread(self.image_paths[idx])
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)
+        mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)/30
 
         if self.transform:
             augmented = self.transform(image=image, mask=mask)
             image = augmented['image']
-            mask = augmented['mask'].unsqueeze(0) / 255.0  # Normalize binary mask to [0, 1]
+            mask = torch.tensor(augmented['mask'], dtype=torch.long)  # shape: [H, W]
         return image, mask
-    
 
 def get_transforms(input_size):
     train_transform = A.Compose([
@@ -129,8 +120,7 @@ def get_transforms(input_size):
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.3),
         A.RandomRotate90(p=0.5),
-        A.ColorJitter(p=0.3),
-        A.GaussianBlur(p=0.2),
+        A.ColorJitter(p=0.2),
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
         ToTensorV2()
     ])
@@ -143,55 +133,69 @@ def get_transforms(input_size):
     return train_transform, val_transform
 
 
-
+# ---------------------------
+# TRAINING
+# ---------------------------
 class SegmentationTrainer:
-    def __init__(self, model, model_name, train_loader, val_loader, device,
-                 initial_lr=1e-4, patience=10, output_path="", use_dice_loss=True,freeze = True):
+    def __init__(self, model,input_size, model_name, train_loader, val_loader, device,
+                 initial_lr=1e-4, patience=10, output_path="", freeze=True, num_classes=4,
+                 weight_ce=1.0, weight_dice=1.0,class_weights= None):
         self.model = model.to(device)
+
+        self.input_size = input_size
         self.model_name = model_name
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
-        self.initial_lr = initial_lr
         self.output_path = output_path
-        self.use_dice_loss = use_dice_loss
         self.freeze = freeze
-        os.makedirs(output_path,exist_ok=True)
-        self.bce = nn.BCEWithLogitsLoss()
+        self.patience = patience
+        self.initial_lr = initial_lr
+        self.num_classes = num_classes
+        self.weight_ce = weight_ce
+        self.weight_dice = weight_dice
+        self.class_weights = class_weights
+        if class_weights != None:
+            self.class_weights = class_weights.to(device)
+        
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
+
         if self.freeze:
-            for param in self.model.backbone.parameters():
-                param.requires_grad = False
+            if "dino" not in self.model_name:
+                for param in self.model.encoder.parameters():
+                    param.requires_grad = False
+            else:
+                for param in self.model.backbone.parameters():
+                    param.requires_grad = False
 
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.initial_lr)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='max', patience=3, factor=0.5)
+        self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights)
+        self.iou_metric = JaccardIndex(task='multiclass', num_classes=num_classes).to(device)
 
-        self.iou_metric = BinaryJaccardIndex().to(device)
         self.best_iou = 0
-        self.patience = patience
         self.early_stop_counter = 0
-
         self.train_loss_history = []
         self.val_loss_history = []
         self.train_iou_history = []
         self.val_iou_history = []
 
-    def dice_loss(self, pred, target, smooth=1):
-        pred = torch.sigmoid(pred)
-        intersection = (pred * target).sum(dim=(2, 3))
-        union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
-        dice = (2. * intersection + smooth) / (union + smooth)
+    def multiclass_dice_loss(self, preds, targets):
+        # preds: [B, C, H, W], targets: [B, H, W]
+        preds = torch.softmax(preds, dim=1)
+        targets_one_hot = F.one_hot(targets, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+
+        dims = (0, 2, 3)
+        intersection = (preds * targets_one_hot).sum(dims)
+        union = preds.sum(dims) + targets_one_hot.sum(dims)
+        dice = (2. * intersection + 1e-7) / (union + 1e-7)
         return 1 - dice.mean()
 
-    def focal_loss(self,inputs, targets, alpha=0.8, gamma=2):
-        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        pt = torch.exp(-BCE_loss)
-        F_loss = alpha * (1 - pt) ** gamma * BCE_loss
-        return F_loss.mean()
-    
-    def combined_loss(self, pred, target):
-        dice = self.dice_loss(pred, target) if self.use_dice_loss else 0
-        focal =  self.focal_loss(pred, target)
-        return focal + dice
+    def combined_loss(self, preds, targets):
+        ce = self.ce_loss(preds, targets)
+        dice = self.multiclass_dice_loss(preds, targets)
+        return self.weight_ce * ce + self.weight_dice * dice
 
     def train_one_epoch(self, epoch):
         self.model.train()
@@ -202,21 +206,18 @@ class SegmentationTrainer:
         for images, labels in progress_bar:
             images, labels = images.to(self.device), labels.to(self.device)
             self.optimizer.zero_grad()
-            with torch.amp.autocast('cuda'):
-                outputs = self.model(images)
-                loss = self.combined_loss(outputs, labels)
-            
+            outputs = self.model(images)  # [B, C, H, W]
+            loss = self.combined_loss(outputs, labels)
             loss.backward()
             self.optimizer.step()
             running_loss += loss.item()
 
-            preds = torch.sigmoid(outputs) > 0.5
-            iou = self.iou_metric(preds.int().squeeze(1), labels.int().squeeze(1))
+            preds = torch.argmax(outputs, dim=1)
+            iou = self.iou_metric(preds, labels)
             all_iou.append(iou.item())
 
         epoch_loss = running_loss / len(self.train_loader)
         epoch_iou = np.mean(all_iou)
-
         self.train_loss_history.append(epoch_loss)
         self.train_iou_history.append(epoch_iou)
         return epoch_loss, epoch_iou
@@ -229,18 +230,16 @@ class SegmentationTrainer:
             progress_bar = tqdm(self.val_loader, desc=f"Epoch [{epoch}] - Validation", leave=False)
             for images, labels in progress_bar:
                 images, labels = images.to(self.device), labels.to(self.device)
-                with torch.amp.autocast('cuda'):
-                    outputs = self.model(images)
-                    loss = self.combined_loss(outputs, labels)
+                outputs = self.model(images)
+                loss = self.combined_loss(outputs, labels)
                 running_loss += loss.item()
 
-                preds = torch.sigmoid(outputs) > 0.5
-                iou = self.iou_metric(preds.int().squeeze(1), labels.int().squeeze(1))
+                preds = torch.argmax(outputs, dim=1)
+                iou = self.iou_metric(preds, labels)
                 all_iou.append(iou.item())
 
         epoch_loss = running_loss / len(self.val_loader)
         epoch_iou = np.mean(all_iou)
-
         self.val_loss_history.append(epoch_loss)
         self.val_iou_history.append(epoch_iou)
         self.scheduler.step(epoch_iou)
@@ -258,56 +257,75 @@ class SegmentationTrainer:
                 self.best_iou = val_iou
                 self.early_stop_counter = 0
                 print(f"[INFO] New best model found! Saving...")
-                torch.save(self.model.state_dict(), os.path.join(self.output_path, self.model_name+".pth"))
+                torch.save(self.model.state_dict(), os.path.join(self.output_path, self.model_name + ".pth"))
             else:
                 self.early_stop_counter += 1
             if self.early_stop_counter >= self.patience:
                 print("[INFO] Early stopping triggered.")
                 break
+def compute_class_weights(mask_paths, num_classes):
+    class_counts = Counter()
+    print("Computing Class Weights ...")
+    for path in tqdm(mask_paths):
+        mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        mask = (mask // 30).astype(np.uint8)
+
+        unique, counts = np.unique(mask, return_counts=True)
+        class_counts.update(dict(zip(unique, counts)))
+    total = sum(class_counts.values())
+    freqs = np.array([class_counts.get(i, 0) / total for i in range(num_classes)])
+    weights = 1.0 / (freqs + 1e-6)
+    weights = weights / weights.sum() * num_classes  # normalize to sum ≈ num_classes
+    return torch.tensor(weights, dtype=torch.float32)
+
 
 if __name__ == "__main__":
+     
+    NUM_CLASSES =  6+1
+    model = DINOv2SegHeadV2(num_classes=NUM_CLASSES)
     input_size = 518
+    batch_size = 4
     parser = argparse.ArgumentParser(description="Binary segmentation training")
     parser.add_argument("dataset_path", type=str, help="Path to the dataset")
     parser.add_argument("output_path", type=str, help="Path to save the model")
     args = parser.parse_args()
     dataset_path = args.dataset_path
-    class_name = os.path.basename(dataset_path)
     output_path = args.output_path
-    output_path = os.path.join(output_path, "binary", class_name)
-    os.makedirs(output_path,exist_ok=True)
-
+    output_path = os.path.join(output_path, "multiclass")
+    os.makedirs(output_path,exist_ok=True) 
     image_dir = os.path.join(dataset_path, "images")
     mask_dir = os.path.join(dataset_path, "labels")
-
     image_paths = sorted(glob.glob(os.path.join(image_dir, "*.png")))+sorted(glob.glob(os.path.join(image_dir, "*.jpg")))
-    print("number of images: ", len(image_paths))
     mask_paths = sorted(glob.glob(os.path.join(mask_dir, "*.png")))+sorted(glob.glob(os.path.join(mask_dir, "*.jpg")))
-    print("number of masks: ", len(mask_paths))
 
-    train_imgs, val_imgs, train_masks, val_masks = train_test_split(image_paths, mask_paths, test_size=0.1, random_state=SEED)
-    train_transform, val_transform = get_transforms(input_size=input_size)
+    train_imgs, val_imgs, train_masks, val_masks = train_test_split(image_paths, mask_paths, test_size=0.2, random_state=42)
+    train_transform, val_transform = get_transforms(input_size)
+
+    class_weights = compute_class_weights(train_masks, num_classes=NUM_CLASSES)
+    # class_weights = None
+    print("Number of images:", len(image_paths))
+    print("Number of masks:", len(mask_paths))
+
     train_dataset = SegmentationDataset(train_imgs, train_masks, transform=train_transform)
     val_dataset = SegmentationDataset(val_imgs, val_masks, transform=val_transform)
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-    # model = DINOv2SegHead()
-    # for param in model.upsampler.parameters():
-    #     param.requires_grad = False
-    
-    model = DINOv2SegHeadV2()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     trainer = SegmentationTrainer(
         model=model,
-        model_name="dinov2_segmentor_v2",
+        input_size = input_size,
+        model_name="DINOv2SegHeadV2DatasetV0",
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
-        output_path=output_path,
-        use_dice_loss=True,
-        freeze = True,
-        initial_lr=1e-4
-    )
-    # Train
-    trainer.fit(epochs=45)
+        output_path=os.path.join(output_path),
+        freeze=False,
+        initial_lr=1e-4,
+        num_classes=NUM_CLASSES,            
+        weight_ce=0.5,
+        weight_dice=1.5,
+        class_weights = class_weights
+        )
+
+    trainer.fit(epochs=70)
