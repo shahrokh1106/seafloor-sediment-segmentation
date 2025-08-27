@@ -20,6 +20,9 @@ from featup.upsamplers import JBUStack
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch.nn as nn
+from transformers import SegformerImageProcessor
+from transformers import SegformerForSemanticSegmentation
+
 
 SEED = 42
 random.seed(SEED)                   
@@ -30,45 +33,97 @@ torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True   
 torch.backends.cudnn.benchmark = False      
 os.environ['PYTHONHASHSEED'] = str(SEED)   
+from sklearn.decomposition import PCA
 
+class TorchPCA(object):
 
+    def __init__(self, n_components):
+        self.n_components = n_components
+
+    def fit(self, X):
+        self.mean_ = X.mean(dim=0)
+        unbiased = X - self.mean_.unsqueeze(0)
+        U, S, V = torch.pca_lowrank(unbiased, q=self.n_components, center=False, niter=4)
+        self.components_ = V.T
+        self.singular_values_ = S
+        return self
+
+    def transform(self, X):
+        t0 = X - self.mean_.unsqueeze(0)
+        projected = t0 @ self.components_.T
+        return projected
+def pca(image_feats_list, dim=3, fit_pca=None, use_torch_pca=True, max_samples=None):
+    device = image_feats_list[0].device
+
+    def flatten(tensor, target_size=None):
+        if target_size is not None and fit_pca is None:
+            tensor = F.interpolate(tensor, (target_size, target_size), mode="bilinear")
+        B, C, H, W = tensor.shape
+        return tensor.permute(1, 0, 2, 3).reshape(C, B * H * W).permute(1, 0).detach().cpu()
+
+    if len(image_feats_list) > 1 and fit_pca is None:
+        target_size = image_feats_list[0].shape[2]
+    else:
+        target_size = None
+
+    flattened_feats = []
+    for feats in image_feats_list:
+        flattened_feats.append(flatten(feats, target_size))
+    x = torch.cat(flattened_feats, dim=0)
+
+    # Subsample the data if max_samples is set and the number of samples exceeds max_samples
+    if max_samples is not None and x.shape[0] > max_samples:
+        indices = torch.randperm(x.shape[0])[:max_samples]
+        x = x[indices]
+
+    if fit_pca is None:
+        if use_torch_pca:
+            fit_pca = TorchPCA(n_components=dim).fit(x)
+        else:
+            fit_pca = PCA(n_components=dim).fit(x)
+
+    reduced_feats = []
+    for feats in image_feats_list:
+        x_red = fit_pca.transform(flatten(feats))
+        if isinstance(x_red, np.ndarray):
+            x_red = torch.from_numpy(x_red)
+        x_red -= x_red.min(dim=0, keepdim=True).values
+        x_red /= x_red.max(dim=0, keepdim=True).values
+        B, C, H, W = feats.shape
+        reduced_feats.append(x_red.reshape(B, H, W, dim).permute(0, 3, 1, 2).to(device))
+
+    return reduced_feats, fit_pca
+
+def show_image_with_mean_encoder_feats(original_image, encoder_feats, window_name='Image + Mean Features'):
+    """
+    Shows the original image next to the mean encoder feature map.
+
+    Args:
+        original_image (np.ndarray): Original RGB image as a NumPy array [H, W, 3].
+        encoder_feats (torch.Tensor): [1, C, H, W] tensor of encoder features.
+        window_name (str): Name of the OpenCV window.
+    """
+    with torch.no_grad():
+        feats = encoder_feats[0].detach().cpu().numpy()  # [C, H, W]
+        # mean_feat = np.mean(feats, axis=0)               # [H, W]
+
+        # Normalize mean feature to 0–255 and convert to heatmap
+        mean_feat = (mean_feat - mean_feat.min()) / (mean_feat.max() - mean_feat.min() + 1e-6)
+        mean_feat_uint8 = (mean_feat * 255).astype(np.uint8)
+        heatmap = cv2.applyColorMap(mean_feat_uint8, cv2.COLORMAP_JET)  # [H, W, 3]
+
+        # Resize both to half
+        mg_resized = cv2.resize(original_image, (heatmap.shape[1], heatmap.shape[0]))
+        # Concatenate side by side
+        print(feats.shape)
+        side_by_side = np.concatenate([mg_resized, heatmap], axis=1)
+
+        # Show
+        cv2.imshow(window_name, side_by_side)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
 class DINOv2SegHead(nn.Module):
-    def __init__(self, backbone_name='vit_base_patch14_dinov2.lvd142m', num_classes=1):
-        super().__init__()
-        self.backbone = timm.create_model(backbone_name, pretrained=True, features_only=True)
-        self.num_levels = 3
-        in_channels_per_level = 768 
-        projection_dim = 128
-        self.proj_layers = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(in_channels_per_level, projection_dim, kernel_size=1),
-                nn.BatchNorm2d(projection_dim),
-                nn.ReLU(inplace=True)
-            ) for _ in range(self.num_levels)
-        ])
-        total_decoder_in_channels = projection_dim * self.num_levels  # = 128 * 3 = 384
-        self.decoder = nn.Sequential(
-            nn.Conv2d(total_decoder_in_channels, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(128, num_classes, kernel_size=1)
-        )
-        self.upsampler = JBUStack(feat_dim=num_classes)
- 
-    def forward(self, x):
-        features = self.backbone(x)
-        projected_feats = [proj(feat) for feat, proj in zip(features, self.proj_layers)]
-        fused = torch.cat(projected_feats, dim=1)  
-        out = self.decoder(fused)
-        return  F.interpolate(self.upsampler(out,x), size=(518, 518), mode='bilinear', align_corners=False) 
-
-class DINOv2SegHeadV2(nn.Module):
     def __init__(self, backbone_name='vit_base_patch14_dinov2.lvd142m', num_classes=1):
         super().__init__()
         self.backbone = timm.create_model(backbone_name, pretrained=True, features_only=True)
@@ -114,12 +169,10 @@ class DinoFeatureMatching():
         self.show_scale_percentage = show_scale_percentage
         self.inputsize = 518
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.upsampler = JBUStack(feat_dim=768).to(self.device)
-        self.model = timm.create_model("vit_base_patch14_dinov2.lvd142m", pretrained=True).to(self.device)
-        self.model.eval()
+        self.upsampler = torch.hub.load("mhamilton723/FeatUp", 'dinov2', use_norm=True).to(self.device)
         self.upsampler.eval()
         self.transform = T.Compose([T.ToPILImage(),T.Resize((self.inputsize, self.inputsize)),T.ToTensor(),norm])
-    
+
     def get_roi(self,image,show_scale = 300):
         IMAGE = image.copy()
         def draw_rectangle(event, x, y, flags, params):
@@ -160,17 +213,6 @@ class DinoFeatureMatching():
         else:
             raise Exception("No roi has selected")
     
-    def get_patch_image(self, image, roi,width,height):
-        x1,y1,x2,y2 = roi
-        scale_x = self.inputsize / width
-        scale_y = self.inputsize / height
-        x1_r = int(x1 * scale_x)
-        x2_r = int(x2 * scale_x)
-        y1_r = int(y1 * scale_y)
-        y2_r = int(y2 * scale_y)
-        patch_image = image[y1_r:y2_r, x1_r:x2_r]
-        return patch_image
-    
     def get_patch_feature(self, roi,width,height, image_embedding):
         H_prime = int(np.sqrt(image_embedding.shape[0]))
         W_prime = H_prime
@@ -186,27 +228,26 @@ class DinoFeatureMatching():
         y2 = int(y2 * scale_y)
         patch_features = image_embedding[y1:y2, x1:x2, :]  # shape: [h, w, C]
         patch_features = patch_features.mean(axis=(0, 1)) 
-        return patch_features
+        patch_features = patch_features / np.linalg.norm(patch_features)
+
+        return patch_features # (384,)
     
     def get_image_feature(self, image):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         with torch.no_grad():
-            image_tensor = self.transform(image).unsqueeze(0).to(self.device) # [1, 3, 518, 518]
-            image_embedding =self.model.forward_features(image_tensor)  # [1, 1370, 768]
-            image_embedding = image_embedding[:, 1:, :] # [1, 1369, 768]
-            image_embedding = image_embedding.reshape(1,int(np.sqrt(image_embedding.shape[1])), int(np.sqrt(image_embedding.shape[1])), image_embedding.shape[2])
-            image_embedding = image_embedding.permute(0, 3, 1, 2)
-            image_embedding = self.upsampler(image_embedding, image_tensor)
-            image_embedding = image_embedding.contiguous().view(1,image_embedding.shape[1],-1) # [1, 768, 350464] --> 768,592*592
-            image_embedding = image_embedding.permute(0,2,1).squeeze().cpu().numpy()  # [1, 350464, 768]
+            image_tensor = self.transform(image).unsqueeze(0).to(self.device) # (1, 3, 518, 518)
+            image_embedding =self.upsampler(image_tensor)  # (1,384, 592, 592)
+            B, C, H, W = image_embedding.shape  # B=1, C=384, H=592, W=592
+            image_embedding_high = image_embedding.permute(0, 2, 3, 1)  # (1, 592, 592, 384)
+            image_embedding = image_embedding_high.reshape(B, H * W, C).cpu().numpy()  # (1, 592*592, 384) or (1,350464, 384)
             image_embedding = image_embedding / np.linalg.norm(image_embedding, axis=1, keepdims=True)
-        return image_embedding
+            image_embedding_low =self.upsampler.model(image_tensor) 
+        return image_embedding[0],image_embedding_high,image_embedding_low # (350464, 384),(1,384, 592, 592), (1,384, 37, 37)
    
     def get_similarity_map(self,image_embedding,patch_embedding,width, height):
         similarity = image_embedding @ patch_embedding.T  # [350464,]
         sim_map = similarity.reshape(int(np.sqrt(similarity.shape[0])), int(np.sqrt(similarity.shape[0]))) # [592,592]
         sim_map = (sim_map - sim_map.min()) / (sim_map.max() - sim_map.min())
-
         sim_map_resized = cv2.resize(sim_map, (width, height), interpolation=cv2.INTER_CUBIC)
         return sim_map_resized
     
@@ -223,18 +264,143 @@ class DinoFeatureMatching():
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
-    # def adaptive_mask(self, sim_map, sigma=2, k=2):
-    #     blurred = ndimage.gaussian_filter(sim_map, sigma=sigma)
-    #     mean_val = blurred.mean()
-    #     std_val = blurred.std()
-    #     threshold = mean_val + k * std_val
-    #     binary_mask = ((blurred > threshold) * 255).astype(np.uint8)
-    #     return binary_mask
-    
-    def adaptive_mask(self, sim_map, sigma=2, threshold=0.5):
+    def get_affinity_mask(self, sim_map,image_embedding,image_embedding_high,image_embedding_low):
+        def random_walk_refine(Y0, affinity, alpha=0.9, num_iter=20):
+            DIRECTIONS = [
+                (-1,  0),  # up
+                ( 1,  0),  # down
+                ( 0, -1),  # left
+                ( 0,  1),  # right
+                (-1, -1),  # up-left
+                (-1,  1),  # up-right
+                ( 1, -1),  # down-left
+                ( 1,  1),  # down-right
+            ]
+            """
+            Fast GPU-based random walk refinement.
+            Args:
+                Y0: [B, C, H, W] initial soft predictions (e.g., softmax outputs)
+                affinity: [B, H, W, 8] affinity map
+                alpha: propagation strength (0 < alpha < 1)
+                num_iter: number of propagation iterations
+            Returns:
+                Refined soft predictions [B, C, H, W]
+            """
+            B, C, H, W = Y0.shape
+            Y = Y0.clone()
+            for _ in range(num_iter):
+                Y_new = torch.zeros_like(Y)
+                for i, (dy, dx) in enumerate(DIRECTIONS):
+                    affinity_weight = affinity[..., i]  # [B, H, W]
+                    affinity_weight = affinity_weight.unsqueeze(1)  # [B, 1, H, W]
+                    # Shift prediction
+                    shifted = F.pad(Y, (1, 1, 1, 1), mode='replicate')  # pad to handle borders
+                    shifted = shifted[:, :, 1+dy:H+1+dy, 1+dx:W+1+dx]  # shifted prediction
+                    Y_new += affinity_weight * shifted
+                Y = alpha * Y_new + (1 - alpha) * Y0
+            
+            return Y
+        
+        def compute_affinity_from_features(feat_map):
+            """
+            Compute 8-directional affinity map from feature embeddings.
+            feat_map: Tensor of shape (B, D, H, W)
+            Returns: Tensor of shape (B, H, W, 8)
+            """
+            directions = [(-1, 0), (1, 0), (0, -1), (0, 1),
+                        (-1, -1), (-1, 1), (1, -1), (1, 1)]
+            affinities = []
+            for dx, dy in directions:
+                shifted = torch.roll(feat_map, shifts=(dx, dy), dims=(2, 3))  # shift H, W
+                dist = torch.norm(feat_map - shifted, dim=1, keepdim=True)    # L2 over D
+
+                affinity = torch.exp(-dist*10)  # similarity from distance
+                affinities.append(affinity)  # (B, 1, H, W)
+            # Stack and return as (B, H, W, 8)
+            return torch.cat(affinities, dim=1).permute(0, 2, 3, 1)
+
+        sim_map_tensor = torch.tensor(sim_map, dtype=torch.float32, device=self.device)  # (H, W)
+        foreground = sim_map_tensor  # similarity as foreground
+        background = 1.0 - foreground  # inverse similarity as background
+        sim_map_tensor = torch.stack([background, foreground], dim=0)  # (2, H, W)
+        sim_map_tensor = sim_map_tensor.unsqueeze(0) # (1, 2, H, W)
+
+        image_embedding_high = image_embedding_high.permute(0,3,1,2)
+        
+        image_embedding = image_embedding.reshape(592, 592, 384)  # (H, W, C)
+        image_embedding = torch.tensor(image_embedding, dtype=torch.float32, device=self.device)
+        image_embedding = image_embedding.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
+
+        affinity_map = compute_affinity_from_features(image_embedding_high)
+        affinity_map = F.interpolate(affinity_map.permute(0, 3, 1, 2), size=(sim_map_tensor.shape[2], sim_map_tensor.shape[3]), mode='bilinear', align_corners=False) 
+        affinity_map = affinity_map.permute(0, 2, 3, 1)
+        refined_mask = random_walk_refine(sim_map_tensor, affinity_map)
+        refined_mask = refined_mask.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)*255
+
+        # import matplotlib.pyplot as plt
+        # aff_map_np = affinity_map[0].detach().cpu().numpy()  # (H, W, 8)
+        # H, W, C = aff_map_np.shape
+        # H, W, _ = aff_map_np.shape
+        # rgb_vis = np.zeros((H, W, 3), dtype=np.float32)
+        # aff_map_norm = (aff_map_np - aff_map_np.min()) / (aff_map_np.max() - aff_map_np.min() + 1e-8)
+        # # RED: horizontal
+        # rgb_vis[:, :, 0] = 0.5 * (aff_map_norm[:, :, 3] + aff_map_norm[:, :, 4])
+        # # GREEN: vertical
+        # rgb_vis[:, :, 1] = 0.5 * (aff_map_norm[:, :, 1] + aff_map_norm[:, :, 6])
+        # # BLUE: diagonals
+        # rgb_vis[:, :, 2] = 0.25 * (
+        #     aff_map_norm[:, :, 0] + aff_map_norm[:, :, 2] +
+        #     aff_map_norm[:, :, 5] + aff_map_norm[:, :, 7]
+        # )
+        # rgb_vis[:, :, 0] = (rgb_vis[:, :, 0] - rgb_vis[:, :, 0].min()) / (rgb_vis[:, :, 0].max() - rgb_vis[:, :, 0].min() + 1e-8)
+        # rgb_vis[:, :, 1] = (rgb_vis[:, :, 1] - rgb_vis[:, :, 1].min()) / (rgb_vis[:, :, 1].max() - rgb_vis[:, :, 1].min() + 1e-8)
+        # rgb_vis[:, :, 2] = (rgb_vis[:, :, 2] - rgb_vis[:, :, 2].min()) / (rgb_vis[:, :, 2].max() - rgb_vis[:, :, 2].min() + 1e-8)
+        # gamma = 0.4
+        # rgb_vis = np.power(rgb_vis, gamma)
+        # plt.figure(figsize=(8, 8))
+        # plt.imshow(rgb_vis)
+        # plt.title("Affinity Map as RGB Composite")
+        # plt.axis('off')
+        # plt.tight_layout()
+        # plt.savefig("affinity_rgb_composite.png", dpi=300)
+
+        # [lr_feats_pca, hr_feats_pca], _ = pca([image_embedding_low[0].unsqueeze(0), image_embedding_high[0].unsqueeze(0)])
+        # def save_feature_map(tensor, save_path, upscale_size=None, apply_colormap=False):
+        #     """
+        #     Visualizes and saves a feature map (B, C, H, W) as a grayscale image.
+        #     """
+        #     tensor = tensor.squeeze(0)  # (C, H, W)
+        #     feat_mean = tensor.mean(dim=0).cpu().numpy()  # (H, W)
+        #     feat_norm = (feat_mean - feat_mean.min()) / (feat_mean.max() - feat_mean.min() + 1e-8)  # [0,1]
+
+        #     if upscale_size:
+        #         feat_norm = cv2.resize(feat_norm, upscale_size, interpolation=cv2.INTER_CUBIC)
+        #         feat_norm = (feat_norm - feat_norm.min()) / (feat_norm.max() - feat_norm.min() + 1e-8)  # [0,1]
+
+        #     if apply_colormap:
+        #         feat_color = cv2.applyColorMap((feat_norm * 255).astype(np.uint8), cv2.COLORMAP_VIRIDIS)
+        #         plt.imsave(save_path, feat_color)
+        #     else:
+        #         plt.imsave(save_path, feat_norm, cmap='gray')
+
+        # # Example usage
+        # save_feature_map(hr_feats_pca, "image_embedding_highres.png", apply_colormap=True)
+        # save_feature_map(lr_feats_pca, "image_embedding_lowres.png", apply_colormap=True)
+        
+        return refined_mask
+
+    def adaptive_mask(self, sim_map, sigma=2, k=2):
         blurred = ndimage.gaussian_filter(sim_map, sigma=sigma)
+        mean_val = blurred.mean()
+        std_val = blurred.std()
+        threshold = mean_val + k * std_val
         binary_mask = ((blurred > threshold) * 255).astype(np.uint8)
         return binary_mask
+    
+    # def adaptive_mask(self, sim_map, sigma=2, threshold=0.7):
+    #     # sim_map = ndimage.gaussian_filter(sim_map, sigma=sigma)
+    #     binary_mask = ((sim_map > threshold) * 255).astype(np.uint8)
+    #     return binary_mask
     
     def refine_mask_with_superpixels(self, image_bgr, binary_mask, n_segments=700, compactness=10):
         image_lab = img_as_float(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB))
@@ -358,14 +524,15 @@ class DinoFeatureMatching():
             print("The given region of interest (roi) must have four coordinate as x1,y1,x2,y2")
             roi = self.get_roi(img_org,show_scale = self.show_scale_percentage)
         full_image = img_org.copy()
-        image_embedding = self.get_image_feature(full_image)
+        image_embedding,image_embedding_high,image_embedding_low = self.get_image_feature(full_image)
         patch_embedding = self.get_patch_feature(roi,width,height, image_embedding)
         sim_map= self.get_similarity_map(image_embedding, patch_embedding,width,height)
         overlay = self.get_overlay_heatmap(sim_map,img_org.copy())
         if self.debug:
             self.show_image(overlay)
-        # binary_mask = self.adaptive_mask(sim_map, sigma=2, k=0.5)
-        binary_mask = self.adaptive_mask(sim_map)
+        binary_mask = self.get_affinity_mask(sim_map,image_embedding,image_embedding_high,image_embedding_low)
+        # binary_mask = self.adaptive_mask(sim_map, sigma=1, k=0.3)
+        # binary_mask = self.adaptive_mask(sim_map)
         if self.refine_mask_auto:
             binary_mask = self.refine_mask_with_superpixels(img_org.copy(), binary_mask, n_segments=700, compactness=10)
         if self.debug:
@@ -376,8 +543,6 @@ class DinoFeatureMatching():
             binary_mask = self.refine_mask_manually(binary_mask, img_org.copy())
         return binary_mask
     
-
-
 
 class MultiMaskAnnotator():
     def __init__(self, masks_dict,class_order, show_scale_percentage=50):
@@ -393,6 +558,7 @@ class MultiMaskAnnotator():
         self.erasing = False
         self.auto_refine = False
         self.reset = False
+        self.discard = False
 
     def _generate_colors(self, n):
         np.random.seed(42)
@@ -471,6 +637,8 @@ class MultiMaskAnnotator():
                 self.auto_refine=True
             elif key == ord("r"):
                 self.reset = True
+            elif key == ord("q"):
+                self.discard =True
             elif key in [ord(str(i+1)) for i in range(len(self.class_names))]:
                 self.current_class_idx = key - ord('1')
 
@@ -491,7 +659,9 @@ class MultiMaskAnnotator():
             "Bryozoans": 6.0,
         }
         for class_name in self.class_order:
-            combined_mask[self.masks_dict[class_name] == 255] = index_order[class_name]
+            combined_mask[self.masks_dict[class_name] >=128 ] = index_order[class_name]
+        if self.discard==True:
+            combined_mask = np.zeros_like(combined_mask)
         return combined_mask
     
 
@@ -516,8 +686,7 @@ class DinoSegmentorMultiClassFromBinary():
         class_names = list(self.model_paths.keys())
         models_dict = dict()
         for class_name in class_names:
-            # temp_model = DINOv2SegHead()
-            temp_model = DINOv2SegHeadV2()
+            temp_model = DINOv2SegHead()
             temp_model.load_state_dict(torch.load(self.model_paths[class_name], map_location=self.device))
             temp_model.eval()
             temp_model.to(self.device)
@@ -605,12 +774,13 @@ class DinoSegmentorMultiClassFromBinary():
 
 
 class DinoSegmentorMultiClassRefiner():
-    def __init__(self, label_map,model_path,input_size,predict_mode,show_scale_percentage,refine_mask_auto,superpixel,refine_mask_manual,debug,thresholds):
+    def __init__(self, label_map,model_path,input_size,predict_mode,show_scale_percentage,refine_mask_auto,superpixel,refine_mask_manual,debug,thresholds,seg_model_name="Segformer"):
         self.model_path = model_path
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.label_map = label_map
         self.NUM_CLASSES = len(label_map)
         self.input_size =input_size
+        self.seg_model_name = seg_model_name
         self.model = self.load_model()
         self.transform = A.Compose([A.Resize(self.input_size, self.input_size),A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),ToTensorV2()])
         self.predict_mode = predict_mode
@@ -624,9 +794,28 @@ class DinoSegmentorMultiClassRefiner():
 
 
     def load_model(self):
-        model = DINOv2SegHeadV2(num_classes=self.NUM_CLASSES).to(self.device)
+        if self.seg_model_name=="Dinov2Segv1":
+            model = DINOv2SegHead(num_classes=self.NUM_CLASSES).to(self.device)
+        elif self.seg_model_name=="Dinov2Segv2":
+            model = DINOv2SegHeadV2(num_classes=self.NUM_CLASSES).to(self.device)
+        elif self.seg_model_name =="Segformer":
+            id2label = {i: self.label_map[i] for i in range(len(self.label_map))}
+            label2id = {v: k for k, v in id2label.items()}
+            SEGFORMER_MODEL_NAME = "nvidia/segformer-b4-finetuned-ade-512-512"
+            model = SegformerForSemanticSegmentation.from_pretrained(
+                SEGFORMER_MODEL_NAME,
+                num_labels=len(self.label_map),
+                id2label=id2label,
+                label2id=label2id,
+                ignore_mismatched_sizes=True,
+                )
+        else:
+            raise ValueError("Model name should be chosen from Dinov2Segv1 or Dinov2Segv2 or Segformer")
+
         model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+        model.to(self.device)
         model.eval()
+        
         return model
     
     
@@ -651,6 +840,9 @@ class DinoSegmentorMultiClassRefiner():
         masks_dict = dict()
         with torch.no_grad(), torch.amp.autocast('cuda'):
             output = self.model(input_tensor)
+            if self.seg_model_name=="Segformer":
+                output = output.logits
+                output = nn.functional.interpolate(output, size=(self.input_size,self.input_size),mode="bilinear",align_corners=False)
             preds = torch.argmax(output, dim=1)
             preds = preds[0].cpu().squeeze().numpy() 
 
@@ -662,7 +854,7 @@ class DinoSegmentorMultiClassRefiner():
         return masks_dict  
 
 
-    def predict_(self, path, threshold=0.5):
+    def predict_(self, path):
         image = cv2.imread(path)
         self.height, self.width = image.shape[:2]
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -670,8 +862,11 @@ class DinoSegmentorMultiClassRefiner():
 
         with torch.no_grad(), torch.amp.autocast('cuda'):
             output = self.model(input_tensor)
-
+            if self.seg_model_name=="Segformer":
+                output = output.logits
+                output = nn.functional.interpolate(output, size=(self.input_size,self.input_size),mode="bilinear",align_corners=False)
         probs = torch.sigmoid(output)  # shape: [B, C, H, W]
+
         masks = probs.cpu().numpy()[0]
         output_mask = np.zeros((masks.shape[1], masks.shape[2])).astype(np.uint8)
         thresholds = self.thresholds

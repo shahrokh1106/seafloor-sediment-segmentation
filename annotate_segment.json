@@ -1,0 +1,10 @@
+{
+    "image_paths": "datasets/segmented/Multiclass/validvalid_fig/",
+    "output_path": "datasets/segmented/Multiclass/validvalid_fig/",
+    "annotate_mode": "multiclass_refinement",
+    "predict_mode": "argmax",
+    "multiclass_model_name": "New Folder/SegformerDatasetV0.pth",
+    "binary_model_name": "dinov2_segmentor_v2.pth",
+    "refine_mask_auto": false,
+    "refine_mask_manual": true
+}

@@ -56,41 +56,6 @@ class DINOv2SegHead(nn.Module):
 
             nn.Conv2d(128, num_classes, kernel_size=1)
         )
-        self.upsampler = JBUStack(feat_dim=num_classes)
- 
-    def forward(self, x):
-        features = self.backbone(x)
-        projected_feats = [proj(feat) for feat, proj in zip(features, self.proj_layers)]
-        fused = torch.cat(projected_feats, dim=1)  
-        out = self.decoder(fused)
-        return  F.interpolate(self.upsampler(out,x), size=(518, 518), mode='bilinear', align_corners=False) 
-
-class DINOv2SegHeadV2(nn.Module):
-    def __init__(self, backbone_name='vit_base_patch14_dinov2.lvd142m', num_classes=1):
-        super().__init__()
-        self.backbone = timm.create_model(backbone_name, pretrained=True, features_only=True)
-        self.num_levels = 3
-        in_channels_per_level = 768 
-        projection_dim = 128
-        self.proj_layers = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(in_channels_per_level, projection_dim, kernel_size=1),
-                nn.BatchNorm2d(projection_dim),
-                nn.ReLU(inplace=True)
-            ) for _ in range(self.num_levels)
-        ])
-        total_decoder_in_channels = projection_dim * self.num_levels  # = 128 * 3 = 384
-        self.decoder = nn.Sequential(
-            nn.Conv2d(total_decoder_in_channels, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(128, num_classes, kernel_size=1)
-        )
 
         self.upsample = nn.Upsample(scale_factor=14, mode='bilinear', align_corners=False)
 
@@ -146,7 +111,7 @@ def get_transforms(input_size):
 
 class SegmentationTrainer:
     def __init__(self, model, model_name, train_loader, val_loader, device,
-                 initial_lr=1e-4, patience=10, output_path="", use_dice_loss=True,freeze = True):
+                 initial_lr=1e-4, patience=4, output_path="", use_dice_loss=True,freeze = True):
         self.model = model.to(device)
         self.model_name = model_name
         self.train_loader = train_loader
@@ -285,22 +250,21 @@ if __name__ == "__main__":
     mask_paths = sorted(glob.glob(os.path.join(mask_dir, "*.png")))+sorted(glob.glob(os.path.join(mask_dir, "*.jpg")))
     print("number of masks: ", len(mask_paths))
 
-    train_imgs, val_imgs, train_masks, val_masks = train_test_split(image_paths, mask_paths, test_size=0.1, random_state=SEED)
+    train_imgs, val_imgs, train_masks, val_masks = train_test_split(image_paths, mask_paths, test_size=0.2, random_state=SEED)
     train_transform, val_transform = get_transforms(input_size=input_size)
     train_dataset = SegmentationDataset(train_imgs, train_masks, transform=train_transform)
     val_dataset = SegmentationDataset(val_imgs, val_masks, transform=val_transform)
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
 
-    # model = DINOv2SegHead()
-    # for param in model.upsampler.parameters():
-    #     param.requires_grad = False
+    model = DINOv2SegHead()
+    # for param in model.backbone.parameters():
+        # param.requires_grad = False
     
-    model = DINOv2SegHeadV2()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     trainer = SegmentationTrainer(
         model=model,
-        model_name="dinov2_segmentor_v2",
+        model_name="dinov2_binary_segmentor",
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
@@ -310,4 +274,4 @@ if __name__ == "__main__":
         initial_lr=1e-4
     )
     # Train
-    trainer.fit(epochs=45)
+    trainer.fit(epochs=100)
