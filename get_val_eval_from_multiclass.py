@@ -88,9 +88,8 @@ def get_transforms(input_size):
 
 
 if __name__ == "__main__":
-    seg_model_names = ["SegformerB0", "SegformerB2","SegformerB4","DeepLab","DeepLabPlus", "Unet", "Unetplusplus", "DPT", "UPerNet", "MAnet"]
-    seg_model_names = ["Unetplusplus", "DPT", "UPerNet", "MAnet"]
-    seg_model_names = ["Mask2Former"]
+    seg_model_names = ["SegformerB0", "SegformerB2","SegformerB4","DeepLab","DeepLabPlus", "Unet", "Unetplusplus", "DPT", "UPerNet", "MAnet","Mask2Former"]
+    # seg_model_names = ["Segformer"]
     dataset_version = "V3"
     for seg_model_name in seg_model_names:
         model_name = seg_model_name+"Dataset"+dataset_version+".pth"
@@ -116,23 +115,23 @@ if __name__ == "__main__":
         val_image_paths = glob.glob(os.path.join("datasets", "segmented", "Multiclass", "validvalid","images", "*"))
         val_mask_paths = glob.glob(os.path.join("datasets", "segmented", "Multiclass", "validvalid","labels", "*"))
 
-        # val_image_paths.sort()
-        # val_mask_paths.sort()
-        # seed = 42
-        # combined = list(zip(val_image_paths, val_mask_paths))
-        # random.seed(seed)
-        # random.shuffle(combined)
-        # midpoint = len(combined) // 2
-        # set_A = combined[:midpoint]
-        # set_B = combined[midpoint:]
-        # val_image_paths, val_mask_paths = zip(*set_B)
+        val_image_paths.sort()
+        val_mask_paths.sort()
+        seed = 42
+        combined = list(zip(val_image_paths, val_mask_paths))
+        random.seed(seed)
+        random.shuffle(combined)
+        midpoint = len(combined) // 2
+        set_A = combined[:midpoint]
+        set_B = combined[midpoint:]
+        val_image_paths, val_mask_paths = zip(*set_A) #CHOOSE B FOR THE TEST SET
 
         if "Segformer" in seg_model_name:
             if seg_model_name == "SegformerB0":
                 SEGFORMER_MODEL_NAME = "nvidia/segformer-b0-finetuned-ade-512-512"
             elif seg_model_name == "SegformerB2":
                 SEGFORMER_MODEL_NAME = "nvidia/segformer-b2-finetuned-ade-512-512"
-            elif seg_model_name == "SegformerB4":
+            elif seg_model_name == "SegformerB4" or seg_model_name == "Segformer":
                 SEGFORMER_MODEL_NAME = "nvidia/segformer-b4-finetuned-ade-512-512"
             model = SegformerForSemanticSegmentation.from_pretrained(
                 SEGFORMER_MODEL_NAME,
@@ -151,7 +150,7 @@ if __name__ == "__main__":
             Mask2FormerProcessor = AutoImageProcessor.from_pretrained("facebook/mask2former-swin-base-ade-semantic",ignore_index=255,reduce_labels=False)
         elif seg_model_name=="DeepLab":
             backbone_name = "resnet101"
-            model = smp.DeepLabV3Plus(encoder_name=backbone_name,
+            model = smp.DeepLabV3(encoder_name=backbone_name,
                                 encoder_weights = "imagenet",
                                 classes = NUM_CLASSES)    
         elif seg_model_name=="DeepLabPlus":
@@ -263,60 +262,55 @@ if __name__ == "__main__":
                     preds_all.extend(preds.cpu().numpy())
                     labels_all.extend(masks.cpu().numpy())
 
+        BGCK_INDEX = 0
+        IGNORE_INDEX = 255
         preds_np = np.array(preds_all)
         labels_np = np.array(labels_all)
 
         preds_flat = torch.tensor(preds_np).reshape(-1)
         labels_flat = torch.tensor(labels_np).reshape(-1)
-        mask = labels_flat != 255
+        mask = labels_flat != IGNORE_INDEX
         preds_flat = preds_flat[mask]
         labels_flat = labels_flat[mask]
 
         jaccard = MulticlassJaccardIndex(num_classes=NUM_CLASSES, average=None).to(device)
-        dice = MulticlassF1Score(num_classes=NUM_CLASSES, average=None).to(device)
-        dice_mean = MulticlassF1Score(num_classes=NUM_CLASSES, average="macro").to(device)
-        pixel_acc = MulticlassAccuracy(num_classes=NUM_CLASSES, average="micro").to(device)
-        mean_acc = MulticlassAccuracy(num_classes=NUM_CLASSES, average="macro").to(device)
-
-        # Weighted mIoU
+        per_class_iou = jaccard(preds_flat.to(device), labels_flat.to(device)).cpu().tolist()
+        per_class_iou  = [v for i, v in enumerate(per_class_iou)  if i != BGCK_INDEX and v == v]
+        mean_iou = float(np.mean(per_class_iou))
         jaccard_w = MulticlassJaccardIndex(num_classes=NUM_CLASSES, average="weighted").to(device)
         miou_weighted = jaccard_w(preds_flat.to(device), labels_flat.to(device)).item()
 
-        # Weighted pixel accuracy (PA)
+        dice = MulticlassF1Score(num_classes=NUM_CLASSES, average=None).to(device)
+        per_class_dice = dice(preds_flat.to(device), labels_flat.to(device)).cpu().tolist()
+        per_class_dice  = [v for i, v in enumerate(per_class_dice)  if i != BGCK_INDEX and v == v]
+        mean_dice = float(np.mean(per_class_dice))
+        dice_w = MulticlassF1Score(num_classes=NUM_CLASSES, average="weighted").to(device)
+        mdice_weithed = dice_w(preds_flat.to(device), labels_flat.to(device)).item()
+
+
+        pixel_acc = MulticlassAccuracy(num_classes=NUM_CLASSES, average=None).to(device)
+        per_class_acc = pixel_acc(preds_flat.to(device), labels_flat.to(device)).cpu().tolist()
+        per_class_acc  = [v for i, v in enumerate(per_class_acc)  if i != BGCK_INDEX and v == v]
+        mean_pa = float(np.mean(per_class_acc))
         acc_w = MulticlassAccuracy(num_classes=NUM_CLASSES, average="weighted").to(device)
         pa_weighted = acc_w(preds_flat.to(device), labels_flat.to(device)).item()
 
-        per_class_iou = jaccard(preds_flat.to(device), labels_flat.to(device)).cpu().tolist()
-        per_class_dice = dice(preds_flat.to(device), labels_flat.to(device)).cpu().tolist()
-        mean_dice = dice_mean(preds_flat.to(device), labels_flat.to(device)).item()
-        pix_acc = pixel_acc(preds_flat.to(device), labels_flat.to(device)).item()
-        mean_class_acc = mean_acc(preds_flat.to(device), labels_flat.to(device)).item()
-
-        cm = confusion_matrix(labels_flat.cpu(), preds_flat.cpu(), labels=list(range(NUM_CLASSES)))
-        correct_per_class = cm.diagonal()
-        total_per_class = cm.sum(axis=1)
-        pa_per_class = (correct_per_class / total_per_class).tolist()
-        mean_pa = float(np.mean([pa for pa in pa_per_class if not np.isnan(pa)]))
-
         results_dict = {
-            "label_map": label_map,
-            "mean_iou": float(np.mean(per_class_iou)),
+            "label_map": label_map[1:],
+            "mean_iou": mean_iou,
             "per_category_iou": per_class_iou,
-            "per_category_dice": per_class_dice,
-            "mean_dice": mean_dice,
-            "pixel_accuracy": pix_acc,
-            "mean_class_accuracy": mean_class_acc,
-            "pixel_accuracy_per_class": pa_per_class,
-            "mean_pixel_accuracy": mean_pa,
             "mean_iou_weighted": miou_weighted,
+            "mean_dice": mean_dice,
+            "per_category_dice": per_class_dice,
+            "mean_dice_weighted": mdice_weithed,
+            "mean_pixel_accuracy": mean_pa,
+            "pixel_accuracy_per_class": per_class_acc,
             "pixel_accuracy_weighted": pa_weighted,
         }
 
-        # Create output directory
-        output_path = os.path.join("results", "phase-3", model_name)
+        
+        output_path = os.path.join("results", "phase-3", model_name) # add , "test" for the test set
         os.makedirs(output_path, exist_ok=True)
-
-        # Save as JSON
         json_path = os.path.join(output_path, model_name.replace(".pth", "_metrics.json"))
         with open(json_path, "w") as f:
             json.dump(results_dict, f, indent=4)
@@ -336,6 +330,7 @@ if __name__ == "__main__":
             'PatchesWorms': darken_color((20, 255, 255)),      
             'Bryozoans': darken_color((164, 1, 236)),     
             }
+        
         show_scale_percentage =50
         for index, img_path in enumerate(val_image_paths):
             frame = cv2.imread(img_path)

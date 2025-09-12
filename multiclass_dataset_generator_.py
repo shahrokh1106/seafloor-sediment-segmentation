@@ -211,7 +211,6 @@ def random_walk_refine(Y0, affinity, alpha=0.9, num_iter=20):
         ( 1,  1),  # down-right
     ]
     """
-    Fast GPU-based random walk refinement.
     Args:
         Y0: [B, C, H, W] initial soft predictions (e.g., softmax outputs)
         affinity: [B, H, W, 8] affinity map
