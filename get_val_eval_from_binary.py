@@ -3,29 +3,17 @@ import glob
 import cv2
 import torch
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import timm
 from torch import nn
 import torch.nn.functional as F
 import torch.nn as nn
-import torch.optim as optim
 from tqdm import tqdm
 import numpy as np
-from torchmetrics.classification import JaccardIndex
-from collections import Counter
-import argparse
-from PIL import Image
-from transformers import SegformerImageProcessor
-from transformers import SegformerForSemanticSegmentation
 import random
-from featup.upsamplers import JBUStack
-import evaluate
-import copy
 import json
 from torchmetrics.classification import MulticlassJaccardIndex
-import segmentation_models_pytorch as smp
 from torchmetrics.classification import MulticlassJaccardIndex, MulticlassF1Score, MulticlassAccuracy
 from sklearn.metrics import confusion_matrix
 import itertools
@@ -318,10 +306,6 @@ if __name__ == "__main__":
         output_path = os.path.join("results", "phase-2", "VAL", "GT")
         os.makedirs(output_path,exist_ok=True)
         cv2.imwrite(os.path.join(output_path, os.path.basename(img_path)),out)
-
-
-
-
 
         output_mask = preds[index]
         masks_dict = dict()

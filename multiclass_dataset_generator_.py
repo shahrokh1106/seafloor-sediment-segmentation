@@ -101,24 +101,6 @@ def cosine_similarity_maps(
         sim[invalid.unsqueeze(-1).unsqueeze(-1).expand_as(sim)] = float('-inf')
     return sim
 
-def neighbor_affinity_support(cur_labels: torch.Tensor, affinity: torch.Tensor):
-    """
-    cur_labels: (B,H,W) in {0..C-1,255}
-    affinity:   (B,H,W,8) in [0,1]
-    Return: support (B,C,H,W) in [0,1], max aff to any neighbor of that class
-    """
-    B, H, W, K = affinity.shape
-    device = affinity.device
-    dirs = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
-    C = (cur_labels[cur_labels != 255].max().item()+1) if (cur_labels != 255).any() else 1
-    support = torch.zeros((B, C, H, W), device=device)
-    for k,(dy,dx) in enumerate(dirs):
-        neigh = F.pad(cur_labels, (1,1,1,1), mode='replicate')[:, 1+dy:H+1+dy, 1+dx:W+1+dx]
-        affk = affinity[..., k]
-        for c in range(C):
-            support[:, c] = torch.maximum(support[:, c], affk * (neigh == c).float())
-    return support
-
 @torch.no_grad()
 def expand_with_feats(
     probs: torch.Tensor,          # (B,C,H,W) softmax from logits
