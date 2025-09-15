@@ -18,13 +18,23 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
 
+SEED = 42
+random.seed(SEED)                   
+np.random.seed(SEED)               
+torch.manual_seed(SEED)            
+torch.cuda.manual_seed(SEED)       
+torch.cuda.manual_seed_all(SEED)   
+torch.backends.cudnn.deterministic = True   
+torch.backends.cudnn.benchmark = False      
+os.environ['PYTHONHASHSEED'] = str(SEED)   
+
 def get_smooth_sim_map(sim_map):
-    sim_map = sim_map.astype(np.float32)
-    mu  = cv2.GaussianBlur(sim_map, (0,0), sigmaX=3)
-    var = cv2.GaussianBlur((sim_map - mu)**2, (0,0), sigmaX=3)
-    sim_map = (sim_map - mu) / (np.sqrt(var) + 1e-6)
-    # to [0,1]
-    sim_map = (sim_map - sim_map.min()) / (sim_map.max() - sim_map.min() + 1e-8)
+    # sim_map = sim_map.astype(np.float32)
+    # mu  = cv2.GaussianBlur(sim_map, (0,0), sigmaX=1)
+    # var = cv2.GaussianBlur((sim_map - mu)**2, (0,0), sigmaX=1)
+    # sim_map = (sim_map - mu) / (np.sqrt(var) + 1e-6)
+    # # to [0,1]
+    # sim_map = (sim_map - sim_map.min()) / (sim_map.max() - sim_map.min() + 1e-8)
     return sim_map
 
 class TorchPCA(object):
@@ -356,7 +366,7 @@ def get_sim_map_box(path,x, inputsize,patchsize,show_scale,debug, cmap=cv2.COLOR
     return mean_vis,cv2.resize(sim_map, (inputsize,inputsize)),box_org
 
 
-def random_walk_refine(Y0, affinity, alpha=0.9, num_iter=20):
+def random_walk_refine(Y0, affinity, alpha=0.5, num_iter=10):
     DIRECTIONS = [
         (-1,  0),  # up
         ( 1,  0),  # down
@@ -392,50 +402,6 @@ def random_walk_refine(Y0, affinity, alpha=0.9, num_iter=20):
     
     return Y
 
-# def random_walk_refine(Y0, affinity, alpha=0.7, num_iter=30, eps=1e-8):
-#     # DIRECTIONS are (dy, dx) for dims (H,W)
-#     DIRECTIONS = [
-#         (-1,  0),  # up
-#         ( 1,  0),  # down
-#         ( 0, -1),  # left
-#         ( 0,  1),  # right
-#         (-1, -1),  # up-left
-#         (-1,  1),  # up-right
-#         ( 1, -1),  # down-left
-#         ( 1,  1),  # down-right
-#     ]
-#     """
-#     Y0: [B,C,H,W]  (foreground/background seeds or soft prior)
-#     affinity: [B,H,W,8]  (neighbor-wise affinities; NO self-loop)
-#     """
-#     B, C, H, W = Y0.shape
-
-#     # --- (A) make affinities stochastic per-pixel over 8 neighbors ---
-#     A = affinity  # [B,H,W,8]
-#     A_sum = A.sum(dim=-1, keepdim=True) + eps
-#     A = A / A_sum                            # neighbors sum to 1
-
-#     Y = Y0.clone()
-#     for _ in range(num_iter):
-#         Y_new = torch.zeros_like(Y)
-
-#         # accumulate neighbor messages with correct (dy, dx)
-#         for i, (dy, dx) in enumerate(DIRECTIONS):
-#             w = A[..., i].unsqueeze(1)       # [B,1,H,W]
-#             # shift prediction by (dy,dx)
-#             shifted = F.pad(Y, (1,1,1,1), mode='replicate')[:, :, 1+dy:H+1+dy, 1+dx:W+1+dx]
-#             Y_new += w * shifted
-
-#         # teleportation / damping toward seeds (prevents local trapping)
-#         Y = alpha * Y_new + (1 - alpha) * Y0
-
-#         # keep probabilities well-formed
-#         Y = (Y.clamp_min(0) + eps)
-#         Y = Y / (Y.sum(dim=1, keepdim=True) + eps)
-
-#     return Y
-
-
 
 def compute_affinity_from_features(feat_map):
     """
@@ -463,15 +429,17 @@ def get_affinity_mask(sim_map,image_embedding_high,device,show_sclae,debug,cmap)
     sim_map_tensor = torch.stack([background, foreground], dim=0)  # (2, H, W)
     sim_map_tensor = sim_map_tensor.unsqueeze(0) # (1, 2, H, W)
     
-    # image_embedding_high = image_embedding_high.permute(0,3,1,2)
+    image_embedding_high = image_embedding_high.permute(0,3,1,2)
     
-    # affinity_map = compute_affinity_from_features(image_embedding_high).to(device)
-    affinity_map = compute_affinity_from_features(sim_map_tensor).to(device)
+    affinity_map = compute_affinity_from_features(image_embedding_high).to(device)
+    # affinity_map = compute_affinity_from_features(sim_map_tensor).to(device)
     affinity_map = F.interpolate(affinity_map.permute(0, 3, 1, 2), size=(sim_map_tensor.shape[2], sim_map_tensor.shape[3]), mode='bilinear', align_corners=False) 
     affinity_map = affinity_map.permute(0, 2, 3, 1)
     refined_mask = random_walk_refine(sim_map_tensor, affinity_map)
     refined_mask = refined_mask.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)*255
-    refined_mask = (sim_map>0.6).astype(np.uint8)*255
+
+
+    refined_mask = (sim_map>0.5).astype(np.uint8)*255
     
     if debug:
         w = int(refined_mask.shape[1] * show_sclae / 100)
