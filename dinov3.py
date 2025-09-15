@@ -115,14 +115,10 @@ if __name__ == "__main__":
     cv2.rectangle(image_bgr, (box[0],box[1]), (box[2],box[3]), (0, 0, 255), 4)
     OUTPUT.update({"image_box": cv2.resize(image_bgr, (OUTPUTSIZE,OUTPUTSIZE))})
     
-    
-    
-
     OUTPUT_PATH_ = os.path.join(OUTPUT_PATH,str(IMAGE_SIZE),os.path.basename(IMG_PATH[:-4]))
     print(OUTPUT_PATH_)
     os.makedirs(OUTPUT_PATH_, exist_ok=True)
     for key in OUTPUT.keys():
         cv2.imwrite(os.path.join(OUTPUT_PATH_, key+".png"),OUTPUT[key])
-
 
     print("ALL GOOD")

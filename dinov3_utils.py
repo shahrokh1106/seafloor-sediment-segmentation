@@ -28,14 +28,6 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False      
 os.environ['PYTHONHASHSEED'] = str(SEED)   
 
-def get_smooth_sim_map(sim_map):
-    # sim_map = sim_map.astype(np.float32)
-    # mu  = cv2.GaussianBlur(sim_map, (0,0), sigmaX=1)
-    # var = cv2.GaussianBlur((sim_map - mu)**2, (0,0), sigmaX=1)
-    # sim_map = (sim_map - mu) / (np.sqrt(var) + 1e-6)
-    # # to [0,1]
-    # sim_map = (sim_map - sim_map.min()) / (sim_map.max() - sim_map.min() + 1e-8)
-    return sim_map
 
 class TorchPCA(object):
     def __init__(self, n_components):
@@ -166,71 +158,6 @@ def get_rgb_feature_map(x_grid,input_size,show_scale, debug):
         cv2.destroyAllWindows()
     return feat_norm
 
-def kmeans_on_feature_map(x_grid, k=5, fit_samples=100_000, batch_size=8192, standardize=True, seed=42):
-    """
-    x_grid: torch.Tensor [C,H,W] or [1,C,H,W] (float)
-    returns: labels_map [H,W] (np.uint8), kmeans, (optional) scaler
-    """
-    rng = np.random.RandomState(seed)
-    torch.manual_seed(seed)
-    random.seed(seed)
-
-    # Ensure shape [C,H,W]
-    if x_grid.dim() == 4:
-        x_grid = x_grid[0]
-    assert x_grid.dim() == 3, f"Expected [C,H,W], got {tuple(x_grid.shape)}"
-
-    C, H, W = x_grid.shape
-    feats = x_grid.detach().permute(1, 2, 0).reshape(-1, C).cpu().numpy().astype(np.float32)  # [N, C], N=H*W
-
-    # Optional: standardize each feature dimension
-    scaler = None
-    if standardize:
-        scaler = StandardScaler(with_mean=True, with_std=True)
-        # fit scaler on a subset (or all if small)
-        if feats.shape[0] > fit_samples:
-            idx = rng.choice(feats.shape[0], size=fit_samples, replace=False)
-            scaler.fit(feats[idx])
-        else:
-            scaler.fit(feats)
-        feats_scaled = scaler.transform(feats)
-    else:
-        feats_scaled = feats
-
-    # Fit MiniBatchKMeans on a subset for speed/memory; then predict full image
-    if feats.shape[0] > fit_samples:
-        idx_fit = rng.choice(feats.shape[0], size=fit_samples, replace=False)
-        X_fit = feats_scaled[idx_fit]
-    else:
-        X_fit = feats_scaled
-
-    kmeans = MiniBatchKMeans(
-        n_clusters=k,
-        batch_size=batch_size,
-        random_state=seed,
-        n_init='auto',  # sklearn >=1.4
-        max_no_improvement=10,
-        verbose=0
-    )
-    kmeans.fit(X_fit)
-
-    # Predict labels for all pixels
-    labels = kmeans.predict(feats_scaled).astype(np.int32)         # [N]
-    labels_map = labels.reshape(H, W).astype(np.uint8)             # [H,W]
-
-    return labels_map, kmeans, scaler
-
-
-def get_kmeans_clusters_rgb (x_grid, k, debug=True,seed=42):
-    labels_map, kmeans, scaler = kmeans_on_feature_map(x_grid, k=k, fit_samples=120_000, batch_size=8192, standardize=True, seed=seed)
-    vis = (labels_map.astype(np.float32) * (255.0 / max(1, k-1))).astype(np.uint8)
-    vis = cv2.applyColorMap(vis, cv2.COLORMAP_JET)
-    if debug:
-        cv2.imshow("KMeans clusters on ORIGINAL features", vis)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-    return vis
-
 def get_sim_map_points(path,x, inputsize,patchsize,show_scale,debug, cmap=cv2.COLORMAP_INFERNO):
     image_bgr = cv2.imread(path)
     image_bgr = cv2.resize(image_bgr, (inputsize, inputsize))
@@ -252,7 +179,6 @@ def get_sim_map_points(path,x, inputsize,patchsize,show_scale,debug, cmap=cv2.CO
 
     sim = point_features.T@feats
     sim_map = sim.reshape(H,W)
-    sim_map = get_smooth_sim_map(sim_map)
     mean_vis = cv2.normalize(sim_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     mean_vis = cv2.applyColorMap(mean_vis, cmap) 
     mean_vis = cv2.resize(mean_vis, (inputsize, inputsize))
@@ -284,7 +210,6 @@ def get_sim_map_input_points(path,x,points_org, inputsize,patchsize,show_scale,d
 
     sim = point_features.T@feats
     sim_map = sim.reshape(H,W)
-    sim_map = get_smooth_sim_map(sim_map)
     mean_vis = cv2.normalize(sim_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     mean_vis = cv2.applyColorMap(mean_vis, cmap) 
     mean_vis = cv2.resize(mean_vis, (inputsize, inputsize))
@@ -352,7 +277,6 @@ def get_sim_map_box(path,x, inputsize,patchsize,show_scale,debug, cmap=cv2.COLOR
     box_features /= (np.linalg.norm(box_features) + 1e-8)
     sim = box_features.T@feats
     sim_map = sim.reshape(H,W)
-    sim_map = get_smooth_sim_map(sim_map)
     mean_vis = cv2.normalize(sim_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     mean_vis = cv2.applyColorMap(mean_vis, cmap) 
     mean_vis = cv2.resize(mean_vis, (inputsize, inputsize))
@@ -432,7 +356,6 @@ def get_affinity_mask(sim_map,image_embedding_high,device,show_sclae,debug,cmap)
     image_embedding_high = image_embedding_high.permute(0,3,1,2)
     
     affinity_map = compute_affinity_from_features(image_embedding_high).to(device)
-    # affinity_map = compute_affinity_from_features(sim_map_tensor).to(device)
     affinity_map = F.interpolate(affinity_map.permute(0, 3, 1, 2), size=(sim_map_tensor.shape[2], sim_map_tensor.shape[3]), mode='bilinear', align_corners=False) 
     affinity_map = affinity_map.permute(0, 2, 3, 1)
     refined_mask = random_walk_refine(sim_map_tensor, affinity_map)
@@ -496,7 +419,6 @@ def get_mask_sam_box (path,box,inputsize,device,debug,cmap):
     sam_img = Image.open(path)
     sam_img = np.array(sam_img.convert("RGB"))
     sam_img = cv2.resize(sam_img, (inputsize, inputsize))
-    # sam_predictor.reset_predictor()
     sam_predictor.set_image(sam_img)
 
 
